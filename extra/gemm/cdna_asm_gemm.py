@@ -33,12 +33,25 @@ def _magicgu_mulhi(d:int, vmax:int) -> tuple[int,int]:
         if ((((vmax * m_enc) >> 32) + vmax) & 0xFFFFFFFF) >> shift == vmax // d: return m_enc, shift | (1 << 31)
   raise AssertionError(f"cannot compute magic for d={d}, vmax={vmax}")
 
+def _compute_num_wg(spatial_tiles:int) -> int:
+  """Choose numWG so that spatial_tiles is evenly divisible, eliminating Stream-K partial tile boundaries."""
+  if spatial_tiles % NUM_WG == 0: return NUM_WG
+  # find the largest divisor of spatial_tiles that fits within NUM_WG
+  best = 1
+  for d in range(1, int(spatial_tiles**0.5) + 1):
+    if spatial_tiles % d == 0:
+      if d <= NUM_WG: best = max(best, d)
+      if spatial_tiles // d <= NUM_WG: best = max(best, spatial_tiles // d)
+  return best
+
 def compute_gemm_args(M:int, N:int, K:int, batch:int) -> tuple[int, int, int, int, int]:
   assert M % TILE_M == 0 and N % TILE_N == 0 and K % TILE_K == 0, f"shape ({M},{N},{K}) not a multiple of ({TILE_M},{TILE_N},{TILE_K})"
+  spatial_tiles = (M // TILE_M) * (N // TILE_N)
+  numWG = _compute_num_wg(spatial_tiles)
   iters = K // TILE_K
-  total = (M // TILE_M) * (N // TILE_N) * iters
+  total = spatial_tiles * iters
   magic, shift = _magicgu_mulhi(iters, total * batch)
-  return NUM_WG, iters, total, magic, shift
+  return numWG, iters, total, magic, shift
 
 class Kernel:
   def __init__(self): self.instructions, self.labels, self.label_at_pos, self.pos = [], {}, {}, 0
@@ -299,8 +312,8 @@ def build_kernel(batch, M, N, K, dtype):
   k.emit(s_mov_b32(s[49], total))
   k.emit(s_mov_b32(s[62], 0))
   k.emit(s_mov_b32(s[68], 0))
-  # kernel size is 256x256
-  k.emit(s_mov_b32(s[51], 256)); k.emit(s_mov_b32(s[52], 256))
+  # Stream-K workgroup count
+  k.emit(s_mov_b32(s[51], numWG)); k.emit(s_mov_b32(s[52], numWG))
   k.emit(s_mov_b32(s[38], s[36]))
   k.emit(s_mov_b32(s[39], s[37]))
   k.emit(s_mov_b64(s[26:27], s[24:25]))
@@ -310,7 +323,7 @@ def build_kernel(batch, M, N, K, dtype):
   k.emit(s_setprio(3))
   k.emit(s_mov_b32(M0, 133120))
   k.emit(v_mov_b32_e32(v[180], v[0]))
-  # XCCG=256
+  # XCCG=numWG (interleave workgroups across XCDs)
   # labels are named based on function:
   # PGR = Prefetch Global Read (the global→LDS pipeline stage)
   # SK = Stream-K (work partitioning by K-iterations, not tiles)
@@ -318,7 +331,7 @@ def build_kernel(batch, M, N, K, dtype):
   # GLVW = Global Load Vector Width (edge tile width handling)
   # BM0 = Block M offset 0 (register block position)
   # OrdNLL = Ordered No-Load-Loop (final iteration without prefetch loads)
-  k.emit(s_mov_b32(s[75], 256))
+  k.emit(s_mov_b32(s[75], numWG))
   v_divmod(k, s[75], s[2])  # v[18]=quotient, v[19]=remainder
   k.emit(v_readfirstlane_b32_e32(v[71], v[18]))
   k.emit(v_readfirstlane_b32_e32(v[72], v[19]))
@@ -2614,8 +2627,10 @@ def custom_asm_gemm(C:UOp, A:UOp, B:UOp, dname:str) -> UOp:
   batch, M, K = A.shape
   K2, N = B.shape[(1 if B.ndim == 3 else 0):]
   assert K == K2
+  spatial_tiles = (M // TILE_M) * (N // TILE_N)
+  numWG = _compute_num_wg(spatial_tiles)
   lidx = UOp.special(WORKGROUP_SIZE, "lidx0")
-  gidx = UOp.special(NUM_WG, "gidx0")
+  gidx = UOp.special(numWG, "gidx0")
   insts = build_kernel(batch, M, N, K, A.dtype.base)
   lds = UOp(Ops.DEFINE_LOCAL, dtypes.uint8.ptr(size=133_120, addrspace=AddrSpace.LOCAL), (), 'lds')
   sink = UOp.sink(C.base, A.base, B.base, lds, lidx, gidx,
@@ -2649,9 +2664,6 @@ def can_use_asm_gemm(a:Tensor, b:Tensor) -> bool:
   else: dname = a.device
   arch = getattr(Device[dname].renderer, "arch", "")
   if batch not in {1, 2}: return todo(f"GEMM batch size {batch}")
-  # blacklist slow matmul
-  # TODO: why is this slow?
-  if (M,N,K) == (8192, 2304, 16384): return todo("blacklisted slow matmul")
   if (M % TILE_M != 0 or N % TILE_N != 0 or K % TILE_K != 0) and arch == "gfx950":
     return todo(f"GEMM shape ({M},{N},{K}) not a multiple of ({TILE_M},{TILE_N},{TILE_K})")
   return True
