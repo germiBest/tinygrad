@@ -10,6 +10,18 @@ def rfftfreq(n: int, d: float = 1.0, device=None) -> Tensor:
   results = Tensor.arange(N, device=device)
   return results * val
 
+def rfft_matrices(n_fft: int, dtype: DTypeLike = dtypes.default_float, device=None) -> tuple[Tensor, Tensor]:
+  n = Tensor.arange(n_fft, dtype=dtype, device=device).reshape(-1, 1)
+  k = Tensor.arange(n_fft // 2 + 1, dtype=dtype, device=device).reshape(1, -1)
+  angle = (-2.0 * math.pi / n_fft) * (n * k)
+  return angle.cos(), angle.sin()
+
+# periodic=True matches librosa (fftbins=True) / torch.hann_window(periodic=True) -- denominator n.
+# periodic=False matches scipy.signal.windows.hann(sym=True) / matlab -- denominator n-1.
+def hann_window(n: int, periodic: bool = True, dtype: DTypeLike = dtypes.default_float, device=None) -> Tensor:
+  k = Tensor.arange(n, dtype=dtype, device=device)
+  return 0.5 * (1.0 - (2.0 * math.pi * k / (n if periodic else n - 1)).cos())
+
 # just like in librosa
 def fft_frequencies(sr: float, n_fft: int) -> Tensor:
   return rfftfreq(n=n_fft, d=1.0 / sr)

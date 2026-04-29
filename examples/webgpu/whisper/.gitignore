@@ -1,0 +1,4 @@
+net_*.js
+net_*.safetensors
+vocab.json
+consts.json

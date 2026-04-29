@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tinygrad has WebGPU</title>
+<link rel="icon" type="image/x-icon" href="https://raw.githubusercontent.com/tinygrad/tinygrad/master/docs/logo.png">
+<style>
+  * { text-align: center; font-family: monospace; }
+  h1 { padding: 50px 50px 0; font-size: 36px; font-weight: normal; }
+  #mybox { padding: 20px; }
+  #resultbox { padding: 50px; font-size: 20px; min-height: 60px; white-space: pre-wrap; }
+  #time { font-size: 16px; color: grey; margin-top: 10px; }
+  .bigg { font-size: 18px; }
+</style>
+</head>
+<body>
+<h1>WebGPU <a href="https://github.com/tinygrad/tinygrad">tinygrad</a> Whisper!</h1>
+<div id="mybox">
+  <input class="bigg" type="file" id="fileInput" accept="audio/*" disabled>
+  <input class="bigg" type="button" id="recBtn" value="Record 5s" disabled>
+  <input class="bigg" type="button" id="stopBtn" value="Stop" disabled>
+</div>
+<div id="resultbox">loading model...</div>
+<div id="time"></div>
+<script type="module">
+  import melSpec from "./net_melSpec.js";
+  import encoder from "./net_encoder.js";
+  import decoder from "./net_decoder.js";
+
+  const result = document.getElementById("resultbox");
+  const time = document.getElementById("time");
+  const error = (err) => { result.innerText = `error: ${err}`; throw new Error(err); };
+
+  const getDevice = async () => {
+    if (!navigator.gpu) error("WebGPU not supported");
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    if (!adapter) error("no WebGPU adapter");
+    const requiredFeatures = adapter.features.has("shader-f16") ? ["shader-f16"] : [];
+    const requiredLimits = {
+      maxStorageBufferBindingSize: Math.min(adapter.limits.maxStorageBufferBindingSize, 1 << 30),
+      maxBufferSize: Math.min(adapter.limits.maxBufferSize, 1 << 30),
+    };
+    return await adapter.requestDevice({ requiredFeatures, requiredLimits });
+  };
+
+  const timer = async (fn, label = "") => {
+    const start = performance.now();
+    const out = await fn();
+    time.innerText = `${(performance.now() - start).toFixed(1)} ms ${label}`;
+    return out;
+  };
+
+  const decodeTo16kMono = async (buf) => {
+    const tmp = new AudioContext();
+    const audio = await tmp.decodeAudioData(buf);
+    tmp.close();
+    const off = new OfflineAudioContext(1, Math.ceil(audio.duration * 16000), 16000);
+    const src = off.createBufferSource();
+    src.buffer = audio; src.connect(off.destination); src.start(0);
+    return (await off.startRendering()).getChannelData(0);
+  };
+
+  const pad = (arr, n) => {
+    if (arr.length === n) return arr;
+    const out = new Float32Array(n);
+    out.set(arr.length > n ? arr.subarray(0, n) : arr);
+    return out;
+  };
+
+  const argmaxLast = (logits, V) => {
+    let best = logits.length - V, bestVal = logits[best];
+    for (let i = best + 1; i < logits.length; i++) if (logits[i] > bestVal) { bestVal = logits[i]; best = i; }
+    return best - (logits.length - V);
+  };
+
+  const detok = (vocab, id) => {
+    const v = vocab[String(id)];
+    if (!v) return "";
+    if (v.t !== undefined) return v.t;
+    const b = atob(v.b), bytes = new Uint8Array(b.length);
+    for (let i = 0; i < b.length; i++) bytes[i] = b.charCodeAt(i);
+    try { return new TextDecoder("utf-8").decode(bytes); } catch { return ""; }
+  };
+
+  let consts, vocab, melRun, encRun, decRun;
+
+  const load = async () => {
+    const device = await getDevice();
+    consts = await (await fetch("./consts.json")).json();
+    vocab = await (await fetch("./vocab.json")).json();
+    melRun = await timer(() => melSpec.load(device, "./net_melSpec.safetensors"), "(melSpec compile)");
+    encRun = await timer(() => encoder.load(device, "./net_encoder.safetensors"), "(encoder compile)");
+    decRun = await timer(() => decoder.load(device, "./net_decoder.safetensors"), "(decoder compile)");
+    result.innerText = "ready - pick an audio file or record";
+    document.getElementById("fileInput").disabled = false;
+    document.getElementById("recBtn").disabled = false;
+  };
+
+  const transcribe = async (waveform) => {
+    result.innerText = "";
+    const wav = pad(waveform, consts.samples_per_segment);
+    const [mel] = await timer(() => melRun(wav), "(mel)");
+    const [enc] = await timer(() => encRun(mel), "(encode)");
+    const starts = consts.is_multilingual
+      ? [consts.sot, consts.langs["en"], consts.transcribe, consts.notimestamps]
+      : [consts.sot, consts.notimestamps];
+    const step = async (t, p) => argmaxLast((await decRun(new Int32Array([t]), enc, new Int32Array([p])))[0], consts.n_vocab);
+    let pos = 0, next = null;
+    for (const t of starts) next = await step(t, pos++);
+    const t0 = performance.now();
+    for (let i = 0; i < consts.max_tokens_to_sample && next !== consts.eot && pos < consts.max_self_attn_cache_len - 1; i++) {
+      result.innerText += detok(vocab, next);
+      if ((i & 3) === 0) await new Promise(r => setTimeout(r, 0));
+      next = await step(next, pos++);
+    }
+    time.innerText = `${(performance.now() - t0).toFixed(1)} ms (decode ${pos - starts.length} toks)`;
+  };
+
+  document.getElementById("fileInput").addEventListener("change", async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    try { await transcribe(await decodeTo16kMono(await f.arrayBuffer())); } catch (err) { error(err); }
+  });
+
+  let rec, chunks = [];
+  document.getElementById("recBtn").addEventListener("click", async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    chunks = [];
+    rec = new MediaRecorder(stream);
+    rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    rec.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      const blob = new Blob(chunks, { type: rec.mimeType });
+      try { await transcribe(await decodeTo16kMono(await blob.arrayBuffer())); } catch (err) { error(err); }
+      document.getElementById("recBtn").disabled = false;
+      document.getElementById("stopBtn").disabled = true;
+    };
+    rec.start();
+    document.getElementById("recBtn").disabled = true;
+    document.getElementById("stopBtn").disabled = false;
+    setTimeout(() => rec.state === "recording" && rec.stop(), 5000);
+  });
+
+  document.getElementById("stopBtn").addEventListener("click", () => rec && rec.state === "recording" && rec.stop());
+
+  load();
+</script>
+</body>
+</html>
